@@ -36,11 +36,11 @@ def setup_train_args():
     parser.add_argument('--model_config', default='config/model_config_dialogue_small.json', type=str, required=False,
                         help='选择模型参数')
     parser.add_argument('--vocab_path', default='vocabulary/vocab_en.txt', type=str, required=False, help='选择词库')
-    parser.add_argument('--train_raw_path', default='data/dailydialog/train.txt', type=str, required=False, help='原始训练语料')
-    parser.add_argument('--train_tokenized_path', default='data/dailydialog/train_tokenized.txt', type=str,
+    parser.add_argument('--train_raw_path', default='data/dstc7/train.txt', type=str, required=False, help='原始训练语料')
+    parser.add_argument('--train_tokenized_path', default='data/dstc7/train_tokenized.txt', type=str,
                         required=False,
                         help='将原始训练语料tokenize之后的数据的存放位置')
-    parser.add_argument('--log_path', default='data/dailydialog/training.log', type=str, required=False, help='训练日志存放位置')
+    parser.add_argument('--log_path', default='data/dstc7/training.log', type=str, required=False, help='训练日志存放位置')
     parser.add_argument('--raw', action='store_true', help='是否对原始训练语料做tokenize。若尚未对原始训练语料进行tokenize，则指定该参数')
     parser.add_argument('--epochs', default=10, type=int, required=False, help='训练的轮次')
     parser.add_argument('--batch_size', default=8, type=int, required=False, help='训练batch size')
@@ -49,7 +49,7 @@ def setup_train_args():
     parser.add_argument('--log_step', default=1, type=int, required=False, help='多少步汇报一次loss')
     parser.add_argument('--gradient_accumulation', default=1, type=int, required=False, help='梯度积累')
     parser.add_argument('--max_grad_norm', default=1.0, type=float, required=False)
-    parser.add_argument('--dialogue_model_output_path', default='dialogue_model/', type=str, required=False,
+    parser.add_argument('--dialogue_model_output_path', default='dialogue_model/dstc7/', type=str, required=False,
                         help='对话模型输出路径')
     parser.add_argument('--pretrained_model', default='', type=str, required=False, help='预训练的GPT2模型的路径')
     parser.add_argument('--writer_dir', default='tensorboard_summary/', type=str, required=False, help='Tensorboard路径')
@@ -150,7 +150,9 @@ def preprocess_raw_data(args, tokenizer, n_ctx):
                 dialogue_ids.extend([tokenizer.convert_tokens_to_ids(word.lower()) for word in nltk.word_tokenize(utterance)])
                 dialogue_ids.append(tokenizer.sep_token_id)  # 每个utterance之后添加[SEP]，表示utterance结束
             # 对超过n_ctx的长度进行截断,否则GPT2模型会报错
-            dialogue_ids = dialogue_ids[:n_ctx]
+            # NOTE: this is the important point
+            if len(dialogue_ids) > n_ctx:
+                dialogue_ids = [tokenizer.cls_token_id] + dialogue_ids[-(n_ctx-1):]
             for dialogue_id in dialogue_ids:
                 f.write(str(dialogue_id) + ' ')
             # 最后一条记录不添加换行符
@@ -283,7 +285,6 @@ def train(model, device, train_list, multi_gpu, args):
             input_ids = input_ids.to(device)
             # 解决在运行过程中，由于显存不足产生的cuda out of memory的问题
             try:
-                ipdb.set_trace()
                 outputs = model.forward(input_ids=input_ids)
                 loss, accuracy = calculate_loss_and_accuracy(outputs, labels=input_ids, device=device)
 
@@ -311,7 +312,7 @@ def train(model, device, train_list, multi_gpu, args):
                         logger.info(
                             "batch {} of epoch {}, loss {}, accuracy {}".format(batch_idx + 1, epoch + 1, loss,
                                                                                 accuracy))
-                        tb_writer.add_scalar('Dailydialog-loss', loss.item(), overall_step)
+                        tb_writer.add_scalar('loss', loss.item(), overall_step)
             except RuntimeError as exception:
                 if "out of memory" in str(exception):
                     oom_time += 1
@@ -388,21 +389,28 @@ def main():
 
     global pad_id
     pad_id = tokenizer.convert_tokens_to_ids(PAD)
-
-    # 创建对话模型的输出目录
-    if not os.path.exists(args.dialogue_model_output_path):
-        os.mkdir(args.dialogue_model_output_path)
-    # 创建MMI模型的输出目录
-    if not os.path.exists(args.mmi_model_output_path):
-        os.mkdir(args.mmi_model_output_path)
+    
     # 加载GPT2模型
     model, n_ctx = create_model(args, vocab_size)
     model.to(device)
-    # 对原始数据进行预处理,将原始语料转换成对应的token_id
-    if args.raw and args.train_mmi:  # 如果当前是要训练MMI模型
-        preprocess_mmi_raw_data(args, tokenizer, n_ctx)
-    elif args.raw and not args.train_mmi:  # 如果当前是要训练对话生成模型
-        preprocess_raw_data(args, tokenizer, n_ctx)
+
+    if not os.path.exists(args.train_tokenized_path):
+        print(f'cannot find the preprocessed file {args.train_tokenized_path}')
+        # 创建对话模型的输出目录
+        if not os.path.exists(args.dialogue_model_output_path):
+            os.mkdir(args.dialogue_model_output_path)
+        # 创建MMI模型的输出目录
+        if not os.path.exists(args.mmi_model_output_path):
+            os.mkdir(args.mmi_model_output_path)
+            
+        # 对原始数据进行预处理,将原始语料转换成对应的token_id
+        if args.raw and args.train_mmi:  # 如果当前是要训练MMI模型
+            preprocess_mmi_raw_data(args, tokenizer, n_ctx)
+        elif args.raw and not args.train_mmi:  # 如果当前是要训练对话生成模型
+            preprocess_raw_data(args, tokenizer, n_ctx)
+    else:
+        print(f'already exists preprocessed file {args.train_tokenized_path}')
+        
     # 是否使用多块GPU进行并行运算
     multi_gpu = False
     if args.cuda and torch.cuda.device_count() > 1:

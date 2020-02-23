@@ -2,6 +2,7 @@ import transformers
 import torch
 import os
 import json
+import nltk
 import ipdb
 import random
 import numpy as np
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 
 PAD = '[PAD]'
 pad_id = 0
+logger = None
 
 
 def set_interact_args():
@@ -34,19 +36,20 @@ def set_interact_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='0', type=str, required=False, help='生成设备')
     parser.add_argument('--temperature', default=1, type=float, required=False, help='生成的temperature')
-    parser.add_argument('--topk', default=8, type=int, required=False, help='最高k选1')
+    parser.add_argument('--topk', default=4, type=int, required=False, help='最高k选1')
     parser.add_argument('--topp', default=0, type=float, required=False, help='最高积累概率')
+    parser.add_argument('--batch_size', default=4, type=int, required=False, help='最高积累概率')
     parser.add_argument('--model_config', default='config/model_config_dialogue_small.json', type=str, required=False,
                         help='模型参数')
     parser.add_argument('--log_path', default='data/interacting.log', type=str, required=False, help='interact日志存放位置')
     parser.add_argument('--voca_path', default='vocabulary/vocab_en.txt', type=str, required=False, help='选择词库')
-    parser.add_argument('--dialogue_model_path', default='dialogue_model/model_epoch61', type=str, required=False, help='对话模型路径')
-    parser.add_argument('--test_data_path', default='data/dailydialog/src-test.txt', type=str, required=False, help='')
-    parser.add_argument('--save_samples_path', default="sample/dailydialog", type=str, required=False, help="保存聊天记录的文件路径")
+    parser.add_argument('--dialogue_model_path', default='dialogue_model/empchat/model_epoch168', type=str, required=False, help='对话模型路径')
+    parser.add_argument('--test_data_path', default='data/empchat/src-test.txt', type=str, required=False, help='')
+    parser.add_argument('--save_samples_path', default="sample/empchat", type=str, required=False, help="保存聊天记录的文件路径")
     parser.add_argument('--repetition_penalty', default=1.0, type=float, required=False,
                         help="重复惩罚参数，若生成的对话重复性较高，可适当提高该参数")
     parser.add_argument('--seed', type=int, default=None, help='设置种子用于生成随机数，以使得训练的结果是确定的')
-    parser.add_argument('--max_len', type=int, default=100, help='每个utterance的最大长度,超过指定长度则进行截断')
+    parser.add_argument('--max_len', type=int, default=50, help='每个utterance的最大长度,超过指定长度则进行截断')
     parser.add_argument('--max_history_len', type=int, default=5, help="dialogue history的最大长度")
     parser.add_argument('--no_cuda', action='store_true', help='不使用GPU进行预测')
     return parser.parse_args()
@@ -76,6 +79,36 @@ def create_logger(args):
     logger.addHandler(console)
 
     return logger
+
+
+def preprocess_raw_data(raw_path, token_path, tokenizer, n_ctx):
+    """
+    对原始语料进行处理，将原始语料转换为用于train的token id，对于每个dialogue，将其处于成如下形式"[CLS]utterance1[SEP]utterance2[SEP]utterance3[SEP]"
+    :param args:
+    :param tokenizer:
+    :param n_ctx:GPT2模型的上下文窗口大小,对于超过n_ctx(n_ctx包括了特殊字符)的dialogue进行截断
+    :return:
+    """
+    logger.info("tokenizing raw data,raw data path:{}, token output path:{}".format(raw_path, token_path))
+    with open(raw_path, 'rb') as f:
+        data = f.read().decode("utf-8").replace('<user0>', '').replace('<user1>', '').replace('__eou__', '[SEP]')
+        data = data.split('\n')
+        
+    logger.info("there are {} dialogue in raw dataset".format(len(data)))
+    with open(token_path, "w", encoding="utf-8") as f:
+        for dialogue_index, dialogue in enumerate(tqdm(data)):
+            dialogue_ids = [tokenizer.cls_token_id]  # 每个dialogue以[CLS]开头
+            dialogue_ids.extend([tokenizer.convert_tokens_to_ids(word.lower()) for word in nltk.word_tokenize(dialogue)])
+            dialogue_ids.append(tokenizer.sep_token_id)  # 每个utterance之后添加[SEP]，表示utterance结束
+            # 对超过n_ctx的长度进行截断,否则GPT2模型会报错
+            if len(dialogue_ids) > n_ctx:
+                dialogue_ids = [dialogue_ids[0]] + dialogue_ids[-(n_ctx-1):]
+            for dialogue_id in dialogue_ids:
+                f.write(str(dialogue_id) + ' ')
+            # 最后一条记录不添加换行符
+            if dialogue_index < len(data) - 1:
+                f.write("\n")
+    logger.info("finish preprocessing raw data,the result is stored in {}".format(token_path))
 
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
@@ -111,7 +144,30 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     return logits
 
 
+def collate_fn(batch):
+    """
+    计算该batch中的所有sample的最长的input，并且将其他input的长度向其对齐
+    :param batch:
+    :return:
+    """
+    global pad_id
+    input_ids = []
+    btc_size = len(batch)
+    max_input_len = 0  # 该batch中最长的input，用于该batch的数据对齐
+    # 计算该batch中input的最大长度
+    for btc_idx in range(btc_size):
+        if max_input_len < len(batch[btc_idx]):
+            max_input_len = len(batch[btc_idx])
+    # 使用pad_id对小于max_input_len的input_id进行补全
+    for btc_idx in range(btc_size):
+        input_len = len(batch[btc_idx])
+        input_ids.append(batch[btc_idx])
+        input_ids[btc_idx].extend([pad_id] * (max_input_len - input_len))
+    return torch.tensor(input_ids, dtype=torch.long)
+
+
 def main():
+    global logger
     args = set_interact_args()
     logger = create_logger(args)
     # 当用户使用GPU,并且GPU可用时
@@ -123,27 +179,27 @@ def main():
     model = GPT2LMHeadModel.from_pretrained(args.dialogue_model_path)
     model.to(device)
     model.eval()
-    if args.save_samples_path:
-        if not os.path.exists(args.save_samples_path):
-            os.makedirs(args.save_samples_path)
-        samples_file = open(args.save_samples_path + '/samples.txt', 'a', encoding='utf8')
-        samples_file.write("聊天记录{}:\n".format(datetime.now()))
-        # 存储聊天记录，每个utterance以token的id的形式进行存储
-    history = []
-    # print('开始和chatbot聊天，输入CTRL + Z以退出')
+    
+    n_ctx = model.config.to_dict().get("n_ctx")
+    print(f'dialogue model path load: {args.dialogue_model_path}')
+        
     
     # generate the test file
     # read the file and open the writable file
-    print(f'[!] load the model over, begin to generate, ctx: {model.config.to_dict().get("n_ctx")}')
     corpus = []
+    print(f'========== n_ctx of the model and datasets: {n_ctx} ==========')
     with open(args.test_data_path) as f:
         for line in f.readlines():
+            line = line.lower()
             line = line.strip().replace('<user0>', '').replace('<user1>', '').replace('__eou__', '[SEP]')
             corpus.append(line)
-    fw = open('./data/dailydialog/pred.txt', 'w')
+    fw = open(args.save_samples_path, 'w')
     for line in tqdm(corpus):
         input_ids = [tokenizer.cls_token_id] + tokenizer.encode(line) + [tokenizer.sep_token_id]
-        curr_input_tensor = torch.tensor(input_ids[-150:]).long().to(device)
+        if len(input_ids) > n_ctx:
+            curr_input_tensor = torch.tensor([tokenizer.cls_token_id] + input_ids[-(n_ctx-1):]).long().to(device)
+        else:
+            curr_input_tensor = torch.tensor(input_ids).long().to(device)
         
         generated = []
         for _ in range(args.max_len):
@@ -157,7 +213,7 @@ def main():
             filtered_logits = top_k_top_p_filtering(next_token_logits,
                                                     top_k=args.topk, 
                                                     top_p=args.topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1),
+            next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1),
                                            num_samples=1)
             if next_token == tokenizer.sep_token_id:  # 遇到[SEP]则表明response生成结束
                 break
@@ -168,6 +224,7 @@ def main():
         # ipdb.set_trace()
         text = ' '.join(text)
         fw.write(f'{text}\n')
+        fw.flush()
     fw.close()
     
     '''

@@ -1,5 +1,6 @@
 from metric.metric import *
 from tqdm import tqdm
+import sys
 import pickle
 
 
@@ -7,12 +8,15 @@ def load_file(path):
     with open(path) as f:
         corpus = []
         for line in f.readlines():
-            corpus.append(line.strip().replace('<user0>', '').replace('<user1>', '').split())
+            corpus.append(line.lower().strip().replace('<user0>', '').replace('<user1>', '').split())
     return corpus
 
 if __name__ == "__main__":
-    ref = load_file('./data/dailydialog/tgt-test.txt')
-    tgt = load_file('./data/dailydialog/pred.txt')
+    dataset = sys.argv[1]
+    if not dataset:
+        raise Exception('please use the dataset parameter: dailydialog, empchat, ubuntu, personachat, dstc7')
+    ref = load_file(f'./data/{dataset}/tgt-test.txt')
+    tgt = load_file(f'./data/{dataset}/pred.txt')
     
     ref = ref[:len(tgt)]
     
